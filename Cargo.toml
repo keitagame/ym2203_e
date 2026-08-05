@@ -1,0 +1,24 @@
+[package]
+name = "ym2203"
+version = "0.1.0"
+edition = "2021"
+description = "A from-scratch YM2203 (OPN) sound chip emulator in pure Rust: 3ch/4-op FM synthesis + 3ch SSG (AY-3-8910 compatible PSG) + hardware timers, full register map."
+license = "MIT"
+
+[lib]
+name = "ym2203"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+hound = "3.5"
+flate2 = "1.0"
+
+
+[[example]]
+name = "vgmplayer"
+path = "examples/vgmplayer.rs"
+
+[profile.release]
+opt-level = 3
