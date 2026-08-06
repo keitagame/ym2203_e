@@ -1,22 +1,28 @@
-//! FM (OPN) synthesis core: 3 channels x 4 operators.
-//!
-//! This models the register-level behaviour of the YM2203 FM section
-//! (algorithms, feedback, key on/off, envelope generator phases, rate
-//! scaling, SSG-EG loop mode, channel-3 special/CSM frequency mode)
-//! using floating point DSP internally. Pitch (frequency) is computed
-//! from the exact hardware F-Number/Block formula, so intervals and
-//! tuning are accurate. The envelope generator's *shape* (attack /
-//! decay / sustain / release with rate scaling) follows the real
-//! chip's behaviour qualitatively, but the exact per-step timing is a
-//! calibrated exponential approximation rather than a bit-exact
-//! reproduction of the original silicon's internal counter tables.
-//! See README.md for details.
 
 use std::f64::consts::TAU;
 
 pub const NUM_CH: usize = 3;
 const NUM_OP: usize = 4;
 const MAX_ATTEN_DB: f64 = 96.0;
+use std::sync::LazyLock;
+const FB_TABLE: [f64; 8] = [
+    0.0,        // FB=0
+    1.0/16.0,   // FB=1
+    1.0/8.0,    // FB=2
+    1.0/4.0,    // FB=3
+    1.0/2.0,    // FB=4
+    1.0,        // FB=5
+    2.0,        // FB=6
+    4.0,        // FB=7
+];
+static EG_STEP_DB: LazyLock<[f64; 64]> = LazyLock::new(|| {
+    let mut t = [0.0; 64];
+    for i in 0..64 {
+        
+        t[i] = (2f64.powf((i as f64) / 8.0)) * 0.09375;
+    }
+    t
+});
 
 /// Maps the 4-bit "keycode note" nibble taken from the top bits of the
 /// F-Number to the 2-bit note-group used for envelope rate scaling and
@@ -128,21 +134,17 @@ impl Operator {
         ((base_rate as u16 * 2) + ks_scale as u16).min(63) as u8
     }
 
-    fn rate_to_db_per_sample(rate: u8, sample_rate: f64) -> f64 {
-        if rate == 0 {
-            return 0.0;
-        }
-        const K: f64 = 1.5;
-        K * 2f64.powf(rate as f64 / 4.0) / sample_rate
-    }
+   fn rate_to_db_per_sample(rate: u8, sample_rate: f64) -> f64 {
+    if rate == 0 { return 0.0; }
+    EG_STEP_DB[rate as usize] / sample_rate
+}
 
-    fn rate_to_attack_coeff(rate: u8, sample_rate: f64) -> f64 {
-        if rate == 0 {
-            return 0.0;
-        }
-        const KA: f64 = 5.0;
-        (KA * 2f64.powf(rate as f64 / 4.0) / sample_rate).min(1.0)
-    }
+fn rate_to_attack_coeff(rate: u8, sample_rate: f64) -> f64 {
+    if rate == 0 { return 0.0; }
+    // 実機は Attack だけ特別に速い
+    (EG_STEP_DB[rate as usize] * 4.0 / sample_rate).min(1.0)
+}
+
 
     fn sustain_level_db(&self) -> f64 {
         if self.sl == 15 {
@@ -245,15 +247,20 @@ impl Operator {
 
     /// Compute this operator's output sample given a phase-modulation
     /// input (in "turns", i.e. fractions of a full cycle).
-    fn output(&self, modulation: f64) -> f64 {
+    
+    // Operator
+    fn output(&self, modulation_turns: f64) -> f64 {
         if self.eg_phase == EgPhase::Off {
             return 0.0;
         }
         let amp_db = self.atten_db + self.tl as f64 * 0.75;
         let amp = 10f64.powf(-amp_db / 20.0);
-        let mut phase = self.phase + modulation;
+        
+        // modulation_turnsは呼び出し元ですでにスケールされている
+        let mut phase = self.phase + modulation_turns;
         phase -= phase.floor();
-        let s = (phase * TAU).sin() * amp;
+        let s = (phase * std::f64::consts::TAU).sin() * amp;
+        
         if self.ssg_invert {
             -s
         } else {
@@ -317,67 +324,71 @@ impl Channel {
         kc
     }
 
-    /// Render one sample for this channel and advance internal state by
-    /// one sample period.
+    
     pub fn render(&mut self, sample_rate: f64) -> f64 {
-        let fb_scale = if self.feedback == 0 {
+        let fb_gain = FB_TABLE[self.feedback as usize];
+        let fb_turns = if self.feedback == 0 {
             0.0
         } else {
-            (1u32 << self.feedback) as f64 / 128.0
+            2f64.powi(self.feedback as i32 - 6)
         };
-        let fb_in = (self.fb_hist[0] + self.fb_hist[1]) * 0.5 * fb_scale;
-
+        // fb_in はこの時点ですでに「位相を回すターン数」になっている
+        //let fb_in = (self.fb_hist[0] + self.fb_hist[1]) * 0.5 * fb_turns;
+        let fb_in = (self.fb_hist[0] - self.fb_hist[1]) * fb_gain;
         let o = &self.ops;
         let out1 = o[0].output(fb_in);
 
-        let (mix, norm): (f64, f64) = match self.algorithm {
+        
+        const MOD_SCALE: f64 = 4.0;
+
+        let mix: f64 = match self.algorithm {
             0 => {
-                let out2 = o[1].output(out1);
-                let out3 = o[2].output(out2);
-                let out4 = o[3].output(out3);
-                (out4, 1.0)
+                let out2 = o[1].output(out1 * MOD_SCALE);
+                let out3 = o[2].output(out2 * MOD_SCALE);
+                let out4 = o[3].output(out3 * MOD_SCALE);
+                out4
             }
             1 => {
                 let out2 = o[1].output(0.0);
-                let out3 = o[2].output(out1 + out2);
-                let out4 = o[3].output(out3);
-                (out4, 1.0)
+                let out3 = o[2].output((out1 + out2) * MOD_SCALE);
+                let out4 = o[3].output(out3 * MOD_SCALE);
+                out4
             }
             2 => {
                 let out2 = o[1].output(0.0);
-                let out3 = o[2].output(out2);
-                let out4 = o[3].output(out1 + out3);
-                (out4, 1.0)
+                let out3 = o[2].output(out2 * MOD_SCALE);
+                let out4 = o[3].output((out1 + out3) * MOD_SCALE);
+                out4
             }
             3 => {
-                let out2 = o[1].output(out1);
+                let out2 = o[1].output(out1 * MOD_SCALE);
                 let out3 = o[2].output(0.0);
-                let out4 = o[3].output(out2 + out3);
-                (out4, 1.0)
+                let out4 = o[3].output((out2 + out3) * MOD_SCALE);
+                out4
             }
             4 => {
-                let out2 = o[1].output(out1);
+                let out2 = o[1].output(out1 * MOD_SCALE);
                 let out3 = o[2].output(0.0);
-                let out4 = o[3].output(out3);
-                (out2 + out4, 2.0)
+                let out4 = o[3].output(out3 * MOD_SCALE);
+                out2 + out4
             }
             5 => {
-                let out2 = o[1].output(out1);
-                let out3 = o[2].output(out1);
-                let out4 = o[3].output(out1);
-                (out2 + out3 + out4, 3.0)
+                let out2 = o[1].output(out1 * MOD_SCALE);
+                let out3 = o[2].output(out1 * MOD_SCALE);
+                let out4 = o[3].output(out1 * MOD_SCALE);
+                out2 + out3 + out4
             }
             6 => {
-                let out2 = o[1].output(out1);
+                let out2 = o[1].output(out1 * MOD_SCALE);
                 let out3 = o[2].output(0.0);
                 let out4 = o[3].output(0.0);
-                (out2 + out3 + out4, 3.0)
+                out2 + out3 + out4
             }
             _ => {
                 let out2 = o[1].output(0.0);
                 let out3 = o[2].output(0.0);
                 let out4 = o[3].output(0.0);
-                (out1 + out2 + out3 + out4, 4.0)
+                out1 + out2 + out3 + out4
             }
         };
 
@@ -390,9 +401,9 @@ impl Channel {
             self.ops[slot].update_envelope(kc[slot], sample_rate);
         }
 
-        mix / norm
+        // チャンネルごとのマスターボリューム（アルゴリズム7などで1.0を超えないための調整）
+        mix
     }
-
     /// CSM mode: fire a brief key-on/key-off pulse on all 4 slots
     /// (used to auto-trigger channel 3 from Timer A overflow).
     pub fn csm_trigger(&mut self) {

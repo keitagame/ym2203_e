@@ -1,42 +1,4 @@
-//! # ym2203
-//!
-//! A complete, pure-Rust software emulation of the Yamaha **YM2203 (OPN)**
-//! sound chip: 3-channel / 4-operator FM synthesis, a 3-channel SSG
-//! (AY-3-8910 compatible PSG), the two hardware timers (A/B), channel-3
-//! "special" 4-frequency mode, CSM mode, SSG-EG, and the prescaler.
-//!
-//! ## What "complete" means here
-//! Every documented YM2203 register is decoded and has an effect:
-//! SSG (0x00-0x0D), timers & mode (0x24-0x2B, 0x2D-0x2F), key on/off
-//! (0x28), all per-operator FM parameters (0x30-0x9F), F-Number/Block
-//! including channel-3 special mode (0xA0-0xAE), and
-//! feedback/algorithm (0xB0-0xB2).
-//!
-//! The chip's *pitch* (frequency) is computed from the exact hardware
-//! F-Number/Block formula, so this emulator is musically in tune with
-//! real hardware and real music-driver register dumps. The FM envelope
-//! generator and SSG hardware envelope reproduce the real chip's
-//! *behaviour* (attack/decay/sustain/release, rate scaling, envelope
-//! shapes 0-15, looping SSG-EG) using calibrated DSP approximations
-//! rather than a bit-exact reproduction of the original silicon's
-//! internal counter/lookup tables -- see README.md for details and for
-//! why that tradeoff was made.
-//!
-//! ## Example
-//! ```no_run
-//! use ym2203::Ym2203;
-//!
-//! let mut chip = Ym2203::new(3_993_600, 44_100);
-//! chip.write(0x30, 0x00); // ch0 op(S1): DT=0 MUL=0
-//! chip.write(0xB0, 0x00); // ch0: algorithm 0, feedback 0
-//! chip.write(0x40, 0x00); // ch0 op(S1): TL = 0 (loudest)
-//! chip.write(0x50, 0x1F); // ch0 op(S1): AR = 31 (fastest attack)
-//! chip.write(0x80, 0x0F); // ch0 op(S1): SL=0, RR=15
-//! chip.write(0xA4, 0x22); // ch0 block/fnum hi
-//! chip.write(0xA0, 0x69); // ch0 fnum lo  (~440Hz-ish depending on clock)
-//! chip.write(0x28, 0xF0); // key on ch0, all 4 slots
-//! let samples: Vec<i16> = chip.generate(44_100 / 2);
-//! ```
+
 
 mod fm;
 mod ssg;
@@ -198,34 +160,36 @@ impl Ym2203 {
     }
 
     fn tick_timers(&mut self) {
-        if self.timer_a_running {
-            let period_sec = (1024.0 - self.timer_a_reg as f64) * 12.0 / self.clock as f64;
-            let period_samples = (period_sec * self.sample_rate as f64).max(1.0);
-            self.timer_a_acc += 1.0;
-            if self.timer_a_acc >= period_samples {
-                self.timer_a_acc -= period_samples;
-                if self.timer_a_irq_enable {
-                    self.status |= 0x01;
-                }
-                if self.mode == ChipMode::Csm {
-                    self.fm.csm_trigger();
-                }
+    let fm_clock = self.effective_clock() as f64;
+
+    if self.timer_a_running {
+        let period_sec = (1024.0 - self.timer_a_reg as f64) / (fm_clock / 72.0);
+        let period_samples = (period_sec * self.sample_rate as f64).max(1.0);
+        self.timer_a_acc += 1.0;
+        if self.timer_a_acc >= period_samples {
+            self.timer_a_acc -= period_samples;
+            if self.timer_a_irq_enable {
+                self.status |= 0x01;
             }
-        }
-        if self.timer_b_running {
-            let period_sec = (256.0 - self.timer_b_reg as f64) * 192.0 / self.clock as f64;
-            let period_samples = (period_sec * self.sample_rate as f64).max(1.0);
-            self.timer_b_acc += 1.0;
-            if self.timer_b_acc >= period_samples {
-                self.timer_b_acc -= period_samples;
-                if self.timer_b_irq_enable {
-                    self.status |= 0x02;
-                }
+            if self.mode == ChipMode::Csm {
+                self.fm.csm_trigger();
             }
         }
     }
 
-    /// Render a single sample as a normalized `f32` in roughly [-1.0, 1.0].
+    if self.timer_b_running {
+        let period_sec = (256.0 - self.timer_b_reg as f64) / (fm_clock / 288.0);
+        let period_samples = (period_sec * self.sample_rate as f64).max(1.0);
+        self.timer_b_acc += 1.0;
+        if self.timer_b_acc >= period_samples {
+            self.timer_b_acc -= period_samples;
+            if self.timer_b_irq_enable {
+                self.status |= 0x02;
+            }
+        }
+    }
+}
+
     pub fn generate_sample_f32(&mut self) -> f32 {
         self.tick_timers();
         let fm_out = self.fm.render(self.sample_rate as f64) * self.fm_mix as f64;
